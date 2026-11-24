@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+import argparse
+import socket
+import subprocess
+import sys
+import time
+
+AAP_UUID = "74ec2172-0bad-4d01-8f77-997b2be0722a"
+AAP_PSM = 0x1001
+HEADER = bytes.fromhex("04000400")
+HANDSHAKE = bytes.fromhex("00000400010002000000000000000000")
+SET_FEATURES = HEADER + bytes.fromhex("4d00d700000000000000")
+REQUEST_NOTIFICATIONS = HEADER + bytes.fromhex("0f00ffffffff")
+OP_CUSTOM_EQ = 0x63
+STATE_RECOMMENDED = 1
+STATE_CUSTOM = 2
+
+
+def bluetoothctl(*args):
+    return subprocess.run(
+        ["bluetoothctl", *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def find_airpods():
+    for line in bluetoothctl("devices", "Connected").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "Device":
+            if AAP_UUID in bluetoothctl("info", parts[1]):
+                return parts[1]
+    sys.exit("no connected AirPods found; pass --device AA:BB:CC:DD:EE:FF")
+
+
+def parse_eq(packet):
+    if len(packet) < 13 or packet[:4] != HEADER or packet[4] != OP_CUSTOM_EQ:
+        return None
+    return packet[9], packet[10], packet[11], packet[12]
+
+
+def read_eq(sock, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock.settimeout(max(deadline - time.monotonic(), 0.05))
+        try:
+            eq = parse_eq(sock.recv(4096))
+        except TimeoutError:
+            break
+        if eq:
+            return eq
+    return None
+
+
+def connect(mac):
+    sock = socket.socket(
+        socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
+    )
+    sock.settimeout(5)
+    sock.connect((mac, AAP_PSM))
+    for packet in (HANDSHAKE, SET_FEATURES, REQUEST_NOTIFICATIONS):
+        sock.send(packet)
+        time.sleep(0.2)
+    eq = read_eq(sock, 8)
+    if eq is None:
+        sock.close()
+        sys.exit("AirPods did not report a Custom EQ; firmware may not support it")
+    return sock, eq
+
+
+def write_eq(sock, state, low, mid, high):
+    sock.send(
+        HEADER
+        + bytes([OP_CUSTOM_EQ, 0x00, 0x05, 0x00, 0x01, state, low, mid, high])
+    )
+    time.sleep(0.5)
+
+
+def show(eq):
+    state, low, mid, high = eq
+    mode = {STATE_CUSTOM: "custom", STATE_RECOMMENDED: "recommended"}.get(
+        state, f"unknown({state})"
+    )
+    print(f"mode={mode} low={low} mid={mid} high={high}")
+
+
+def band(value):
+    number = int(value)
+    if not 0 <= number <= 100:
+        raise argparse.ArgumentTypeError("band must be 0-100 (50 is flat)")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Control the on-device Custom EQ of AirPods"
+    )
+    parser.add_argument("--device", help="Bluetooth address of the AirPods")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("get", help="show the current EQ")
+    setter = commands.add_parser("set", help="enable Custom EQ with these bands")
+    for name in ("low", "mid", "high"):
+        setter.add_argument(name, type=band)
+    commands.add_parser("on", help="enable Custom EQ with the stored bands")
+    commands.add_parser("off", help="switch back to Recommended")
+    args = parser.parse_args()
+
+    mac = args.device or find_airpods()
+    sock, (state, low, mid, high) = connect(mac)
+    try:
+        if args.command == "set":
+            write_eq(sock, STATE_CUSTOM, args.low, args.mid, args.high)
+        elif args.command == "on":
+            write_eq(sock, STATE_CUSTOM, low, mid, high)
+        elif args.command == "off":
+            write_eq(sock, STATE_RECOMMENDED, low, mid, high)
+        else:
+            show((state, low, mid, high))
+            return
+    finally:
+        sock.close()
+
+    time.sleep(0.5)
+    sock, eq = connect(mac)
+    sock.close()
+    show(eq)
+
+
+if __name__ == "__main__":
+    main()
